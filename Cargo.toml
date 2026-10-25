@@ -11,10 +11,12 @@ iced = { version = "0.14.0", default-features = false, features = ["tiny-skia", 
 rand = "0.10.3"
 zeroize = "1.9.1"
 
-# Argon2 ist ohne Optimierung etwa 20-mal langsamer. So dauert das Entsperren auch im
-# Debug-Build unter einer Sekunde.
-[profile.dev.package.argon2]
+# Alle Abhängigkeiten auch im Debug-Build optimieren, PassKey selbst nicht.
+# - Der Software-Renderer (tiny-skia) zeichnet beim Scrollen die ganze Fläche neu. Unoptimiert
+#   braucht das rund 90 ms pro Bild (etwa 10 fps), optimiert wenige Millisekunden.
+# - Argon2 ist unoptimiert etwa 20-mal langsamer (Entsperren mehrere Sekunden statt 0,2 s).
+# Der erste Debug-Build dauert dadurch länger, danach baut Cargo nur noch PassKey neu.
+[profile.dev.package."*"]
 opt-level = 3
-
-[profile.dev.package.blake2]
-opt-level = 3
+debug-assertions = false
+overflow-checks = false

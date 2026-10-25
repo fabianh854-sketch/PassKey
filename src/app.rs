@@ -628,7 +628,7 @@ impl App {
         // Die Fläche reicht über die volle Fensterbreite. Der Inhalt hat links und rechts den
         // Seitenrand wie Kopfzeile und Tabs, die schmale Leiste sitzt im rechten Rand. So sind
         // alle Panels so breit wie die Tab-Leiste.
-        let scroll = scrollable(container(body).padding(iced::Padding {
+        let mut scroll = scrollable(container(body).padding(iced::Padding {
             left: theme::SPACE_4,
             right: theme::SPACE_4,
             ..iced::Padding::ZERO
@@ -643,8 +643,12 @@ impl App {
             style
         })
         .id(iced::widget::Id::new(SCROLL_ID))
-        .on_scroll(Message::Scrolled)
         .height(Length::Fill);
+        // Während des weichen Scrollens meldet jedes `scroll_to` nur den Versatz zurück, den die
+        // App gerade selbst gesetzt hat. Ohne das Echo baut iced die Ansicht pro Bild einmal statt zweimal.
+        if !self.motion.scroll.active {
+            scroll = scroll.on_scroll(Message::Scrolled);
+        }
 
         // Weiches Scrollen: Eine durchsichtige Ebene über der Fläche fängt das Mausrad ab und
         // setzt nur das Ziel. Klicks und Hover gehen unverändert an die Elemente darunter.

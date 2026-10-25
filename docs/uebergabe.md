@@ -40,7 +40,8 @@ Ansichten: **Erzeugen** (Ausgabe, Stärke, Slider, Schalter, Neu erzeugen, Kopie
 
 ## Technische Erkenntnisse (iced 0.14, Windows)
 
-- **Argon2 im Debug-Build:** `Cargo.toml` setzt `opt-level = 3` für `argon2` und `blake2`. Ohne das dauert das Entsperren (64 MiB) im Debug-Build mehrere Sekunden, so etwa 0,2 s.
+- **Debug-Build:** `Cargo.toml` optimiert alle Abhängigkeiten auch im Debug-Build (`opt-level = 3`, ohne `debug-assertions` und `overflow-checks`), PassKey selbst nicht. Grund: tiny-skia zeichnet beim Scrollen die ganze Fläche neu. Unoptimiert waren das etwa 100 ms pro Bild (Ruckeln), jetzt im Median 7 ms. Die Prüfungen allein machten fast die Hälfte aus. Argon2 entsperrt so in etwa 0,2 s.
+- **Weiches Scrollen ohne Echo:** Solange die Glättung läuft, hängt kein `on_scroll` an der Scrollfläche. Sonst meldet jedes `scroll_to` den eigenen Versatz zurück, und iced baut die Ansicht pro Bild zweimal.
 - **Hintergrund-Arbeit:** Der tokio-Executor von iced läuft ohne Multi-Thread-Runtime. Argon2 läuft deshalb in `std::thread` und meldet sich über `futures::channel::oneshot` zurück.
 - **Software-Renderer nötig:** `Cargo.toml` nutzt `iced` mit `default-features = false` und `["tiny-skia", "svg", "tokio", "crisp", "web-colors"]`. Mit dem GPU-Renderer (wgpu) waren die Ecken des transparenten Fensters schwarz. tokio läuft nur mit `rt` und `time`, es gibt kein Netzwerk-Crate.
 - **Minimieren erkennen:** iced meldet es nicht als Ereignis. Die App fragt alle 500 ms `window::is_minimized` ab.
