@@ -1,0 +1,20 @@
+[package]
+name = "passkey"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+iced = { version = "0.14.0", default-features = false, features = ["tiny-skia", "svg", "tokio", "crisp", "web-colors"] }
+rand = "0.10.3"
+zeroize = "1.9.1"
+
+# Argon2 ist ohne Optimierung etwa 20-mal langsamer. So dauert das Entsperren auch im
+# Debug-Build unter einer Sekunde.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
