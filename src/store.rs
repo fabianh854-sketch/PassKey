@@ -22,18 +22,23 @@
 //!
 //! Geschrieben wird atomar: erst eine Temp-Datei daneben, dann Umbenennen. Ein Absturz
 //! beim Speichern lässt die alte Datei heil.
+//!
+//! Die Datei gilt als fremde Eingabe: Der Leser prüft Größe, Kopf und jeden Eintrag, bevor er
+//! etwas übernimmt, und greift nur über geprüfte Längen auf die Bytes zu.
 
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use rand::Rng;
+use rand::rngs::SysRng;
+use rand::TryRng;
+use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox, SecretString};
 use zeroize::Zeroizing;
 
-use crate::generator::Options;
+use crate::generator::{self, Options};
 
 const MAGIC: &[u8; 8] = b"PASSKEY\0";
 pub const VERSION: u8 = 1;
@@ -42,6 +47,11 @@ const NONCE_LEN: usize = 24;
 const HEADER_LEN: usize = 8 + 1 + 12 + SALT_LEN + NONCE_LEN;
 const TAG_LEN: usize = 16;
 const KEY_LEN: usize = 32;
+/// Größere Dateien liest PassKey gar nicht erst ein. Ein Eintrag braucht unter 400 Byte,
+/// das reicht also für über 20 000 Einträge.
+const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+/// Längstes Etikett in Zeichen.
+pub const MAX_LABEL_CHARS: usize = 64;
 
 /// Kosten der Schlüsselableitung. Sie stehen im Kopf, damit spätere Versionen sie erhöhen
 /// können, ohne alte Dateien unlesbar zu machen.
@@ -64,12 +74,10 @@ impl KdfParams {
     const MAX_P: u32 = 16;
 
     fn plausible(&self) -> bool {
-        self.p >= 1
-            && self.p <= Self::MAX_P
-            && self.t >= 1
-            && self.t <= Self::MAX_T
-            && self.m_kib >= 8 * self.p
+        (1..=Self::MAX_P).contains(&self.p)
+            && (1..=Self::MAX_T).contains(&self.t)
             && self.m_kib <= Self::MAX_M_KIB
+            && self.p.checked_mul(8).is_some_and(|min| self.m_kib >= min)
     }
 }
 
@@ -77,12 +85,14 @@ impl KdfParams {
 pub enum Error {
     /// Passwort falsch oder Datei verändert. AEAD kann beides nicht unterscheiden.
     WrongPassword,
-    /// Kopf oder Inhalt passen nicht zum Format (fremde Datei, abgeschnitten, neuere Version).
+    /// Kopf oder Inhalt passen nicht zum Format (fremde Datei, abgeschnitten, zu groß, neuere Version).
     Corrupt,
     /// Beim Anlegen liegt dort schon eine Datei. Sie wird nie überschrieben.
     Exists,
+    /// Etikett oder Passwort verletzen die Regeln (Länge, Steuerzeichen).
+    Invalid,
     Io(io::ErrorKind),
-    /// Schlüsselableitung oder Hintergrund-Thread ist gescheitert.
+    /// Zufall, Schlüsselableitung oder Hintergrund-Thread ist gescheitert.
     Internal,
 }
 
@@ -92,21 +102,90 @@ impl From<io::Error> for Error {
     }
 }
 
+/// Text ohne Steuerzeichen mit `min..=max` Zeichen.
+fn valid_text(s: &str, min: usize, max: usize) -> bool {
+    (min..=max).contains(&s.chars().count()) && !s.chars().any(char::is_control)
+}
+
+/// Etikett eines Eintrags: höchstens [`MAX_LABEL_CHARS`] Zeichen, keine Steuerzeichen, auch leer.
+/// Es verrät, wofür ein Passwort ist, und liegt deshalb ebenfalls geschützt im Speicher.
+pub struct Label(SecretString);
+
+impl TryFrom<String> for Label {
+    type Error = Error;
+
+    fn try_from(s: String) -> Result<Self, Error> {
+        let ok = valid_text(&s, 0, MAX_LABEL_CHARS);
+        // Zuerst einpacken: Auch ein abgelehnter Text wird beim Freigeben überschrieben.
+        let secret = SecretString::from(s);
+        if ok { Ok(Self(secret)) } else { Err(Error::Invalid) }
+    }
+}
+
+impl Label {
+    pub fn as_str(&self) -> &str {
+        self.0.expose_secret()
+    }
+}
+
+/// Ein gespeichertes Passwort. Nur über [`Entry::new`] zu bauen, das alle Regeln prüft.
 pub struct Entry {
-    pub label: Zeroizing<String>,
-    pub password: Zeroizing<String>,
+    label: Label,
+    password: SecretString,
     /// Zeitpunkt des Speicherns in Unix-Sekunden (UTC).
-    pub saved_at: i64,
-    pub options: Options,
+    saved_at: i64,
+    options: Options,
+}
+
+impl Entry {
+    /// Das Passwort muss so lang sein, wie der Generator sie erzeugt (12 bis 32 Zeichen).
+    pub fn new(
+        label: Label,
+        password: SecretString,
+        saved_at: i64,
+        options: Options,
+    ) -> Result<Self, Error> {
+        let ok = valid_text(
+            password.expose_secret(),
+            usize::from(generator::MIN_LEN),
+            usize::from(generator::MAX_LEN),
+        );
+        if !ok {
+            return Err(Error::Invalid);
+        }
+        Ok(Self {
+            label,
+            password,
+            saved_at,
+            options,
+        })
+    }
+
+    pub fn label(&self) -> &str {
+        self.label.as_str()
+    }
+
+    pub fn password(&self) -> &str {
+        self.password.expose_secret()
+    }
+
+    pub fn saved_at(&self) -> i64 {
+        self.saved_at
+    }
+
+    #[cfg(test)]
+    pub fn options(&self) -> Options {
+        self.options
+    }
 }
 
 /// Eine entsperrte Datei: Schlüssel und Einträge liegen im RAM, bis sie fallen gelassen wird.
-/// `Zeroizing` überschreibt beides beim Freigeben.
+/// `SecretBox` und `SecretString` überschreiben beides beim Freigeben.
 pub struct Vault {
     path: PathBuf,
     params: KdfParams,
     salt: [u8; SALT_LEN],
-    key: Zeroizing<[u8; KEY_LEN]>,
+    key: SecretBox<[u8; KEY_LEN]>,
     entries: Vec<Entry>,
 }
 
@@ -128,14 +207,54 @@ pub fn default_path() -> PathBuf {
     base.join("PassKey").join("verlauf.pkv")
 }
 
+/// Zufall direkt vom Betriebssystem (unter Windows `ProcessPrng`), ohne Zwischen-Generator.
+fn os_random<const N: usize>() -> Result<[u8; N], Error> {
+    let mut bytes = [0u8; N];
+    SysRng.try_fill_bytes(&mut bytes).map_err(|_| Error::Internal)?;
+    Ok(bytes)
+}
+
+struct Header {
+    params: KdfParams,
+    salt: [u8; SALT_LEN],
+    nonce: [u8; NONCE_LEN],
+}
+
+fn parse_header(bytes: &[u8]) -> Option<Header> {
+    let mut r = Reader { b: bytes, at: 0 };
+    if r.take(8)? != MAGIC || r.array::<1>()? != [VERSION] {
+        return None;
+    }
+    let params = KdfParams {
+        m_kib: r.u32()?,
+        t: r.u32()?,
+        p: r.u32()?,
+    };
+    let salt = r.array()?;
+    let nonce = r.array()?;
+    debug_assert_eq!(r.at, HEADER_LEN);
+    params.plausible().then_some(Header { params, salt, nonce })
+}
+
+/// Liest höchstens [`MAX_FILE_BYTES`]. Eine größere Datei wird gar nicht erst ganz geladen.
+fn read_limited(path: &Path) -> Result<Vec<u8>, Error> {
+    let file = fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).map_or(true, |n| n > MAX_FILE_BYTES) {
+        return Err(Error::Corrupt);
+    }
+    Ok(bytes)
+}
+
 impl Vault {
     /// Legt eine neue, leere Datei an. Langsam (Argon2), daher im Hintergrund aufrufen.
     pub fn create(path: &Path, password: &str, params: KdfParams) -> Result<Self, Error> {
         if path.exists() {
             return Err(Error::Exists);
         }
-        let mut salt = [0u8; SALT_LEN];
-        rand::rng().fill_bytes(&mut salt);
+        let salt = os_random()?;
         let key = derive_key(password, &salt, params)?;
         let vault = Vault {
             path: path.to_owned(),
@@ -150,42 +269,25 @@ impl Vault {
 
     /// Öffnet und entschlüsselt eine Datei. Langsam (Argon2), daher im Hintergrund aufrufen.
     pub fn open(path: &Path, password: &str) -> Result<Self, Error> {
-        let bytes = fs::read(path)?;
-        if bytes.len() < HEADER_LEN + TAG_LEN || &bytes[..8] != MAGIC {
+        let bytes = read_limited(path)?;
+        let header = parse_header(&bytes).ok_or(Error::Corrupt)?;
+        let (aad, sealed) = bytes.split_at_checked(HEADER_LEN).ok_or(Error::Corrupt)?;
+        if sealed.len() < TAG_LEN {
             return Err(Error::Corrupt);
         }
-        if bytes[8] != VERSION {
-            return Err(Error::Corrupt);
-        }
-        let params = KdfParams {
-            m_kib: u32_at(&bytes, 9),
-            t: u32_at(&bytes, 13),
-            p: u32_at(&bytes, 17),
-        };
-        if !params.plausible() {
-            return Err(Error::Corrupt);
-        }
-        let salt: [u8; SALT_LEN] = bytes[21..37].try_into().expect("Länge geprüft");
-        let nonce: [u8; NONCE_LEN] = bytes[37..HEADER_LEN].try_into().expect("Länge geprüft");
 
-        let key = derive_key(password, &salt, params)?;
-        let cipher = XChaCha20Poly1305::new(&(*key).into());
+        let key = derive_key(password, &header.salt, header.params)?;
+        let cipher = XChaCha20Poly1305::new(&(*key.expose_secret()).into());
         let plain = cipher
-            .decrypt(
-                &XNonce::from(nonce),
-                Payload {
-                    msg: &bytes[HEADER_LEN..],
-                    aad: &bytes[..HEADER_LEN],
-                },
-            )
+            .decrypt(&XNonce::from(header.nonce), Payload { msg: sealed, aad })
             .map(Zeroizing::new)
             .map_err(|_| Error::WrongPassword)?;
         let entries = decode(&plain).ok_or(Error::Corrupt)?;
 
         Ok(Vault {
             path: path.to_owned(),
-            params,
-            salt,
+            params: header.params,
+            salt: header.salt,
             key,
             entries,
         })
@@ -208,8 +310,7 @@ impl Vault {
     }
 
     fn write(&self) -> Result<(), Error> {
-        let mut nonce = [0u8; NONCE_LEN];
-        rand::rng().fill_bytes(&mut nonce);
+        let nonce = os_random::<NONCE_LEN>()?;
 
         let mut header = Vec::with_capacity(HEADER_LEN);
         header.extend_from_slice(MAGIC);
@@ -221,8 +322,8 @@ impl Vault {
         header.extend_from_slice(&nonce);
         debug_assert_eq!(header.len(), HEADER_LEN);
 
-        let plain = encode(&self.entries);
-        let cipher = XChaCha20Poly1305::new(&(*self.key).into());
+        let plain = encode(&self.entries)?;
+        let cipher = XChaCha20Poly1305::new(&(*self.key.expose_secret()).into());
         let sealed = cipher
             .encrypt(
                 &XNonce::from(nonce),
@@ -244,11 +345,12 @@ fn derive_key(
     password: &str,
     salt: &[u8; SALT_LEN],
     p: KdfParams,
-) -> Result<Zeroizing<[u8; KEY_LEN]>, Error> {
+) -> Result<SecretBox<[u8; KEY_LEN]>, Error> {
     let params = Params::new(p.m_kib, p.t, p.p, Some(KEY_LEN)).map_err(|_| Error::Internal)?;
-    let mut key = Zeroizing::new([0u8; KEY_LEN]);
+    // Der Schlüssel entsteht direkt im geschützten Speicher, ohne Kopie auf dem Stack.
+    let mut key = SecretBox::new(Box::new([0u8; KEY_LEN]));
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-        .hash_password_into(password.as_bytes(), salt, &mut *key)
+        .hash_password_into(password.as_bytes(), salt, key.expose_secret_mut())
         .map_err(|_| Error::Internal)?;
     Ok(key)
 }
@@ -273,10 +375,6 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
-fn u32_at(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(b[at..at + 4].try_into().expect("Länge geprüft"))
-}
-
 // --- Klartext ---
 
 const F_UPPER: u8 = 1;
@@ -284,6 +382,8 @@ const F_LOWER: u8 = 2;
 const F_DIGITS: u8 = 4;
 const F_SYMBOLS: u8 = 8;
 const F_SIMILAR: u8 = 16;
+/// Feste Bytes pro Eintrag: Zeitpunkt, Länge, Schalter, zwei Längenangaben.
+const ENTRY_FIXED: usize = 8 + 1 + 1 + 2 + 2;
 
 fn flags(o: &Options) -> u8 {
     [
@@ -298,60 +398,59 @@ fn flags(o: &Options) -> u8 {
     .fold(0, |acc, (_, bit)| acc | bit)
 }
 
-fn encode(entries: &[Entry]) -> Zeroizing<Vec<u8>> {
+fn encode(entries: &[Entry]) -> Result<Zeroizing<Vec<u8>>, Error> {
     // Genau passend reservieren: Ein wachsender Vec ließe beim Umlagern ungelöschte Kopien zurück.
-    let size = 4 + entries
-        .iter()
-        .map(|e| 8 + 1 + 1 + 2 + e.label.len() + 2 + e.password.len())
-        .sum::<usize>();
-    let mut out = Zeroizing::new(Vec::with_capacity(size));
-    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    let size = entries.iter().try_fold(4usize, |acc, e| {
+        acc.checked_add(ENTRY_FIXED)?
+            .checked_add(e.label().len())?
+            .checked_add(e.password().len())
+    });
+    let mut out = Zeroizing::new(Vec::with_capacity(size.ok_or(Error::Invalid)?));
+    let count = u32::try_from(entries.len()).map_err(|_| Error::Invalid)?;
+    out.extend_from_slice(&count.to_le_bytes());
     for e in entries {
         out.extend_from_slice(&e.saved_at.to_le_bytes());
         out.push(e.options.length);
         out.push(flags(&e.options));
-        for s in [e.label.as_str(), e.password.as_str()] {
-            // Etikett und Passwort sind kurz (Eingabefeld, höchstens 32 Zeichen).
-            let len = s.len().min(u16::MAX as usize);
-            out.extend_from_slice(&(len as u16).to_le_bytes());
-            out.extend_from_slice(&s.as_bytes()[..len]);
+        for s in [e.label(), e.password()] {
+            // `Label` und `Entry::new` halten beide Texte weit unter 64 KiB.
+            let len = u16::try_from(s.len()).map_err(|_| Error::Invalid)?;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(s.as_bytes());
         }
     }
-    debug_assert_eq!(out.len(), size);
-    out
+    debug_assert_eq!(Some(out.len()), size);
+    Ok(out)
 }
 
 fn decode(b: &[u8]) -> Option<Vec<Entry>> {
     let mut r = Reader { b, at: 0 };
-    let count = u32::from_le_bytes(r.take(4)?.try_into().ok()?) as usize;
-    // Jeder Eintrag braucht mindestens 14 Byte: schützt vor einer riesigen Reservierung.
-    if count > b.len() / 14 {
+    let count = usize::try_from(r.u32()?).ok()?;
+    // Jeder Eintrag braucht mindestens ENTRY_FIXED Byte: schützt vor einer riesigen Reservierung.
+    if count > b.len() / ENTRY_FIXED {
         return None;
     }
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
-        let saved_at = i64::from_le_bytes(r.take(8)?.try_into().ok()?);
-        let length = r.take(1)?[0];
-        let f = r.take(1)?[0];
-        let label = r.string()?;
-        let password = r.string()?;
-        entries.push(Entry {
-            label,
-            password,
-            saved_at,
-            options: Options {
-                length,
-                upper: f & F_UPPER != 0,
-                lower: f & F_LOWER != 0,
-                digits: f & F_DIGITS != 0,
-                symbols: f & F_SYMBOLS != 0,
-                avoid_similar: f & F_SIMILAR != 0,
-            },
-        });
+        let saved_at = i64::from_le_bytes(r.array()?);
+        let [length] = r.array()?;
+        let [f] = r.array()?;
+        let label = Label::try_from(r.string()?).ok()?;
+        let password = SecretString::from(r.string()?);
+        let options = Options {
+            length,
+            upper: f & F_UPPER != 0,
+            lower: f & F_LOWER != 0,
+            digits: f & F_DIGITS != 0,
+            symbols: f & F_SYMBOLS != 0,
+            avoid_similar: f & F_SIMILAR != 0,
+        };
+        entries.push(Entry::new(label, password, saved_at, options).ok()?);
     }
     (r.at == b.len()).then_some(entries)
 }
 
+/// Liest der Reihe nach aus einem Byte-Slice. Jeder Zugriff prüft die Grenzen und gibt sonst `None`.
 struct Reader<'a> {
     b: &'a [u8],
     at: usize,
@@ -359,15 +458,25 @@ struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let s = self.b.get(self.at..self.at.checked_add(n)?)?;
-        self.at += n;
+        let end = self.at.checked_add(n)?;
+        let s = self.b.get(self.at..end)?;
+        self.at = end;
         Some(s)
     }
 
-    fn string(&mut self) -> Option<Zeroizing<String>> {
-        let len = u16::from_le_bytes(self.take(2)?.try_into().ok()?) as usize;
+    fn array<const N: usize>(&mut self) -> Option<[u8; N]> {
+        self.take(N)?.try_into().ok()
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.array()?))
+    }
+
+    /// `u16` Länge, dann so viele Byte UTF-8.
+    fn string(&mut self) -> Option<String> {
+        let len = usize::from(u16::from_le_bytes(self.array()?));
         let s = std::str::from_utf8(self.take(len)?).ok()?;
-        Some(Zeroizing::new(s.to_owned()))
+        Some(s.to_owned())
     }
 }
 
@@ -388,18 +497,23 @@ mod tests {
         dir.join("verlauf.pkv")
     }
 
-    fn entry(label: &str, pw: &str, at: i64) -> Entry {
-        Entry {
-            label: Zeroizing::new(label.into()),
-            password: Zeroizing::new(pw.into()),
-            saved_at: at,
-            options: Options {
-                length: 24,
-                symbols: false,
-                avoid_similar: true,
-                ..Options::default()
-            },
+    fn opts() -> Options {
+        Options {
+            length: 24,
+            symbols: false,
+            avoid_similar: true,
+            ..Options::default()
         }
+    }
+
+    fn entry(label: &str, pw: &str, at: i64) -> Entry {
+        Entry::new(
+            Label::try_from(label.to_owned()).unwrap(),
+            SecretString::from(pw),
+            at,
+            opts(),
+        )
+        .unwrap()
     }
 
     fn filled(name: &str) -> PathBuf {
@@ -417,11 +531,11 @@ mod tests {
         let v = Vault::open(&path, PW).unwrap();
         let e = v.entries();
         assert_eq!(e.len(), 3);
-        assert_eq!(e[0].label.as_str(), "");
-        assert_eq!(e[0].saved_at, -5);
-        assert_eq!(e[1].label.as_str(), "Ümlaut-Shop ✓");
-        assert_eq!(e[2].password.as_str(), "Tz4rM9xQe2LwKc7HaPq3");
-        assert_eq!(e[2].options, entry("", "", 0).options);
+        assert_eq!(e[0].label(), "");
+        assert_eq!(e[0].saved_at(), -5);
+        assert_eq!(e[1].label(), "Ümlaut-Shop ✓");
+        assert_eq!(e[2].password(), "Tz4rM9xQe2LwKc7HaPq3");
+        assert_eq!(e[2].options(), opts());
     }
 
     #[test]
@@ -475,9 +589,24 @@ mod tests {
         fs::write(&path, &original[..HEADER_LEN + 4]).unwrap();
         assert_eq!(Vault::open(&path, PW).unwrap_err(), Error::Corrupt);
 
+        fs::write(&path, &original[..HEADER_LEN - 1]).unwrap();
+        assert_eq!(Vault::open(&path, PW).unwrap_err(), Error::Corrupt);
+
+        fs::write(&path, b"").unwrap();
+        assert_eq!(Vault::open(&path, PW).unwrap_err(), Error::Corrupt);
+
         let mut newer = original.clone();
         newer[8] = VERSION + 1;
         fs::write(&path, &newer).unwrap();
+        assert_eq!(Vault::open(&path, PW).unwrap_err(), Error::Corrupt);
+    }
+
+    #[test]
+    fn oversized_files_are_not_read() {
+        let path = filled("huge");
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.resize(usize::try_from(MAX_FILE_BYTES).unwrap() + 1, 0);
+        fs::write(&path, &bytes).unwrap();
         assert_eq!(Vault::open(&path, PW).unwrap_err(), Error::Corrupt);
     }
 
@@ -496,7 +625,7 @@ mod tests {
         let path = temp_path("nonce");
         let mut v = Vault::create(&path, PW, FAST).unwrap();
         let first = fs::read(&path).unwrap();
-        v.add(entry("a", "b", 1)).unwrap();
+        v.add(entry("a", "Xk7Hc2Wm9Qa5Lt3zZz9a", 1)).unwrap();
         let second = fs::read(&path).unwrap();
         assert_ne!(first[37..HEADER_LEN], second[37..HEADER_LEN]);
         assert_eq!(first[21..37], second[21..37], "Salt bleibt");
@@ -518,16 +647,39 @@ mod tests {
         let mut v = Vault::open(&path, PW).unwrap();
         // Ein Ordner mit dem Namen der Temp-Datei lässt das Schreiben scheitern.
         fs::create_dir(path.with_extension("pkv.tmp")).unwrap();
-        assert!(v.add(entry("neu", "neu", 9)).is_err());
+        assert!(v.add(entry("neu", "Xk7Hc2Wm9Qa5Lt3zZz9a", 9)).is_err());
         assert_eq!(v.entries().len(), 3);
         fs::remove_dir(path.with_extension("pkv.tmp")).unwrap();
         assert_eq!(Vault::open(&path, PW).unwrap().entries().len(), 3);
     }
 
     #[test]
+    fn labels_are_validated() {
+        assert!(Label::try_from(String::new()).is_ok());
+        assert!(Label::try_from("ä".repeat(MAX_LABEL_CHARS)).is_ok());
+        assert_eq!(
+            Label::try_from("a".repeat(MAX_LABEL_CHARS + 1)).err(),
+            Some(Error::Invalid)
+        );
+        assert_eq!(Label::try_from("Bank\nX".to_owned()).err(), Some(Error::Invalid));
+        assert_eq!(Label::try_from("Bank\u{0}".to_owned()).err(), Some(Error::Invalid));
+    }
+
+    #[test]
+    fn entries_need_a_generator_sized_password() {
+        let label = || Label::try_from(String::new()).unwrap();
+        let make = |pw: &str| Entry::new(label(), SecretString::from(pw), 0, opts()).err();
+        assert_eq!(make("zu-kurz"), Some(Error::Invalid));
+        assert_eq!(make(&"x".repeat(33)), Some(Error::Invalid));
+        assert_eq!(make("zwölf-zeichen\t"), Some(Error::Invalid));
+        assert_eq!(make(&"x".repeat(12)), None);
+        assert_eq!(make(&"x".repeat(32)), None);
+    }
+
+    #[test]
     fn decode_rejects_trailing_or_missing_bytes() {
-        let entries = vec![entry("x", "y", 1)];
-        let plain = encode(&entries);
+        let entries = vec![entry("x", "Xk7Hc2Wm9Qa5Lt3zZz9a", 1)];
+        let plain = encode(&entries).unwrap();
         assert!(decode(&plain).is_some());
         assert!(decode(&plain[..plain.len() - 1]).is_none());
         let mut longer = plain.to_vec();
@@ -535,5 +687,18 @@ mod tests {
         assert!(decode(&longer).is_none());
         // Behauptete Anzahl viel größer als die Daten.
         assert!(decode(&[0xff, 0xff, 0xff, 0x7f]).is_none());
+    }
+
+    #[test]
+    fn decode_rejects_entries_that_break_the_rules() {
+        // Ein Eintrag mit 2-Zeichen-Passwort: Ein korrekt verschlüsselter, aber unsinniger Inhalt
+        // wird nicht übernommen.
+        let mut plain = 1u32.to_le_bytes().to_vec();
+        plain.extend_from_slice(&0i64.to_le_bytes());
+        plain.extend_from_slice(&[20, F_LOWER]);
+        plain.extend_from_slice(&0u16.to_le_bytes());
+        plain.extend_from_slice(&2u16.to_le_bytes());
+        plain.extend_from_slice(b"ab");
+        assert!(decode(&plain).is_none());
     }
 }

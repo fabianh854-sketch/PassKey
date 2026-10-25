@@ -9,6 +9,7 @@ chacha20poly1305 = { version = "0.11", default-features = false, features = ["al
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 iced = { version = "0.14.0", default-features = false, features = ["tiny-skia", "svg", "tokio", "crisp", "web-colors"] }
 rand = "0.10.3"
+secrecy = "0.10.3"
 zeroize = "1.9.1"
 
 # Alle Abhängigkeiten auch im Debug-Build optimieren, PassKey selbst nicht.
@@ -20,3 +21,23 @@ zeroize = "1.9.1"
 opt-level = 3
 debug-assertions = false
 overflow-checks = false
+
+[profile.release]
+# Überläufe brechen auch im Release ab, statt still falsche Werte zu liefern.
+overflow-checks = true
+strip = true
+
+[lints.rust]
+# `deny` statt `forbid`: Genau eine Stelle ist ausgenommen, vom Nutzer freigegeben (2026-10-25):
+# `system_prefers_reduced_motion` in motion.rs fragt per FFI die Windows-Einstellung
+# „Animationen anzeigen“ ab. Jedes andere `unsafe` ist ein Compilerfehler.
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "deny"
+indexing_slicing = "warn"
+arithmetic_side_effects = "warn"
+cast_possible_truncation = "warn"
+undocumented_unsafe_blocks = "deny"

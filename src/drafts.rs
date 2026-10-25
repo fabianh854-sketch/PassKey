@@ -10,7 +10,7 @@
 
 use std::time::{Duration, Instant};
 
-use zeroize::Zeroizing;
+use secrecy::{ExposeSecret, SecretString};
 
 use crate::generator::Options;
 
@@ -20,7 +20,7 @@ pub const MAX_DRAFTS: usize = 20;
 
 pub struct Draft {
     pub id: u64,
-    pub password: Zeroizing<String>,
+    pub password: SecretString,
     /// Einstellungen, mit denen das Passwort erzeugt wurde. Sie werden mit dem Eintrag gespeichert.
     pub options: Options,
     pub created: Instant,
@@ -37,9 +37,10 @@ pub struct Drafts {
 }
 
 impl Drafts {
-    pub fn push(&mut self, password: Zeroizing<String>, options: Options, now: Instant) -> u64 {
+    pub fn push(&mut self, password: SecretString, options: Options, now: Instant) -> u64 {
         let id = self.next_id;
-        self.next_id += 1;
+        // 2^64 Entwürfe erreicht niemand. Ein Überlauf wäre harmlos, die alten sind längst weg.
+        self.next_id = self.next_id.wrapping_add(1);
         self.items.push(Draft {
             id,
             password,
@@ -81,7 +82,7 @@ impl Drafts {
         self.items
             .iter()
             .find(|d| d.id == id)
-            .map(|d| d.password.as_str())
+            .map(|d| d.password.expose_secret())
     }
 
     #[cfg(test)]
@@ -113,7 +114,7 @@ impl Drafts {
         had_items
     }
 
-    /// Löscht alle Entwürfe sofort. `Zeroizing` überschreibt beim Freigeben den Speicher.
+    /// Löscht alle Entwürfe sofort. `SecretString` überschreibt beim Freigeben den Speicher.
     pub fn wipe(&mut self) {
         self.items.clear();
     }
@@ -125,8 +126,8 @@ mod tests {
 
     fn filled(now: Instant) -> Drafts {
         let mut d = Drafts::default();
-        d.push(Zeroizing::new("erstes-passwort".into()), Options::default(), now);
-        d.push(Zeroizing::new("zweites-passwort".into()), Options::default(), now);
+        d.push(SecretString::from("erstes-passwort"), Options::default(), now);
+        d.push(SecretString::from("zweites-passwort"), Options::default(), now);
         d
     }
 
@@ -206,10 +207,10 @@ mod tests {
         let t0 = Instant::now();
         let mut d = Drafts::default();
         for i in 0..(MAX_DRAFTS + 5) {
-            d.push(Zeroizing::new(format!("pw-{i}")), Options::default(), t0);
+            d.push(SecretString::from(format!("pw-{i}")), Options::default(), t0);
         }
         assert_eq!(d.unsaved_count(), MAX_DRAFTS);
-        assert_eq!(d.unsaved().last().unwrap().password.as_str(), "pw-5");
+        assert_eq!(d.unsaved().last().unwrap().password.expose_secret(), "pw-5");
     }
 
     #[test]

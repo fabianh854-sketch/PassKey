@@ -1,0 +1,5 @@
+# Tests dürfen bei Fehlern abbrechen und direkt indizieren: Ein Panic ist dort das Signal.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true

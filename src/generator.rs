@@ -1,8 +1,9 @@
 //! Passworterzeugung. Reine Logik, keine GUI.
 
 use rand::seq::{IndexedRandom, SliceRandom};
-use rand::Rng;
-use zeroize::{Zeroize, Zeroizing};
+use rand::CryptoRng;
+use secrecy::SecretString;
+use zeroize::Zeroizing;
 
 pub const MIN_LEN: u8 = 12;
 pub const MAX_LEN: u8 = 32;
@@ -62,7 +63,7 @@ impl Options {
     }
 
     pub fn length(&self) -> usize {
-        self.length.clamp(MIN_LEN, MAX_LEN) as usize
+        usize::from(self.length.clamp(MIN_LEN, MAX_LEN))
     }
 
     /// Schätzung der Stärke in Bit: Länge × log2(Größe des Zeichenvorrats).
@@ -105,7 +106,9 @@ impl Strength {
 
 /// Erzeugt ein Passwort. Aus jeder gewählten Zeichenart kommt mindestens ein Zeichen vor.
 /// `None`, wenn keine Zeichenart gewählt ist.
-pub fn generate<R: Rng + ?Sized>(opts: &Options, rng: &mut R) -> Option<Zeroizing<String>> {
+///
+/// `CryptoRng` lässt nur kryptografisch sichere Generatoren zu (in der App: `SysRng`).
+pub fn generate<R: CryptoRng + ?Sized>(opts: &Options, rng: &mut R) -> Option<SecretString> {
     let pools = opts.pools();
     if pools.is_empty() {
         return None;
@@ -113,20 +116,24 @@ pub fn generate<R: Rng + ?Sized>(opts: &Options, rng: &mut R) -> Option<Zeroizin
     let all: Vec<char> = pools.iter().flatten().copied().collect();
     let len = opts.length();
 
-    let mut chars: Vec<char> = pools.iter().filter_map(|p| p.choose(rng).copied()).collect();
+    // Beide Puffer vorab passend groß: Ein wachsender Vec ließe beim Umlagern ungelöschte Kopien zurück.
+    let mut chars: Zeroizing<Vec<char>> = Zeroizing::new(Vec::with_capacity(len));
+    chars.extend(pools.iter().filter_map(|p| p.choose(rng).copied()));
     while chars.len() < len {
         chars.push(*all.choose(rng)?);
     }
     chars.shuffle(rng);
 
-    let password: String = chars.iter().collect();
-    chars.zeroize();
-    Some(Zeroizing::new(password))
+    // Alle Zeichen sind ASCII, ein Zeichen ist also ein Byte.
+    let mut password = String::with_capacity(len);
+    password.extend(chars.iter());
+    Some(SecretString::from(password))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secrecy::ExposeSecret;
 
     fn opts(length: u8) -> Options {
         Options {
@@ -139,16 +146,16 @@ mod tests {
     fn length_stays_between_12_and_32() {
         let mut rng = rand::rng();
         for length in 0..=255u8 {
-            let pw = generate(&opts(length), &mut rng).unwrap();
+            let pw = generate(&opts(length), &mut rng).unwrap().expose_secret().to_owned();
             let n = pw.chars().count();
             assert!(
                 (12..=32).contains(&n),
                 "Länge {length} ergab {n} Zeichen"
             );
-            assert_eq!(n, length.clamp(12, 32) as usize);
+            assert_eq!(n, usize::from(length.clamp(12, 32)));
         }
-        assert_eq!(generate(&opts(12), &mut rng).unwrap().chars().count(), 12);
-        assert_eq!(generate(&opts(32), &mut rng).unwrap().chars().count(), 32);
+        assert_eq!(generate(&opts(12), &mut rng).unwrap().expose_secret().to_owned().chars().count(), 12);
+        assert_eq!(generate(&opts(32), &mut rng).unwrap().expose_secret().to_owned().chars().count(), 32);
     }
 
     #[test]
@@ -156,11 +163,11 @@ mod tests {
         let mut rng = rand::rng();
         for length in MIN_LEN..=MAX_LEN {
             for _ in 0..50 {
-                let pw = generate(&opts(length), &mut rng).unwrap();
-                assert!(pw.chars().any(|c| UPPER.contains(c)), "{}", *pw);
-                assert!(pw.chars().any(|c| LOWER.contains(c)), "{}", *pw);
-                assert!(pw.chars().any(|c| DIGITS.contains(c)), "{}", *pw);
-                assert!(pw.chars().any(|c| SYMBOLS.contains(c)), "{}", *pw);
+                let pw = generate(&opts(length), &mut rng).unwrap().expose_secret().to_owned();
+                assert!(pw.chars().any(|c| UPPER.contains(c)), "{}", pw);
+                assert!(pw.chars().any(|c| LOWER.contains(c)), "{}", pw);
+                assert!(pw.chars().any(|c| DIGITS.contains(c)), "{}", pw);
+                assert!(pw.chars().any(|c| SYMBOLS.contains(c)), "{}", pw);
             }
         }
     }
@@ -174,8 +181,8 @@ mod tests {
             ..Options::default()
         };
         for _ in 0..200 {
-            let pw = generate(&o, &mut rng).unwrap();
-            assert!(pw.chars().all(|c| c.is_ascii_alphabetic()), "{}", *pw);
+            let pw = generate(&o, &mut rng).unwrap().expose_secret().to_owned();
+            assert!(pw.chars().all(|c| c.is_ascii_alphabetic()), "{}", pw);
         }
     }
 
@@ -187,8 +194,8 @@ mod tests {
             ..Options::default()
         };
         for _ in 0..500 {
-            let pw = generate(&o, &mut rng).unwrap();
-            assert!(!pw.chars().any(|c| SIMILAR.contains(c)), "{}", *pw);
+            let pw = generate(&o, &mut rng).unwrap().expose_secret().to_owned();
+            assert!(!pw.chars().any(|c| SIMILAR.contains(c)), "{}", pw);
         }
     }
 
@@ -209,9 +216,9 @@ mod tests {
     #[test]
     fn passwords_differ() {
         let mut rng = rand::rng();
-        let a = generate(&Options::default(), &mut rng).unwrap();
-        let b = generate(&Options::default(), &mut rng).unwrap();
-        assert_ne!(*a, *b);
+        let a = generate(&Options::default(), &mut rng).unwrap().expose_secret().to_owned();
+        let b = generate(&Options::default(), &mut rng).unwrap().expose_secret().to_owned();
+        assert_ne!(a, b);
     }
 
     #[test]

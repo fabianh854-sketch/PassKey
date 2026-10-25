@@ -3,6 +3,7 @@
 use iced::alignment::Vertical;
 use iced::widget::{column, container, row, text};
 use iced::{Element, Length};
+use secrecy::ExposeSecret;
 
 use super::widgets::*;
 use crate::app::{App, Message, Notice, VaultState};
@@ -18,7 +19,7 @@ pub fn view<'a>(app: &'a App, t: Tokens, fx: &Fx) -> Element<'a, Message> {
     // Ausgabe: das aktuelle Passwort auf ruhiger Fläche.
     let output: Element<'a, Message> = match current {
         Some(d) => {
-            let s = d.password.as_str();
+            let s = d.password.expose_secret();
             let size = match s.chars().count() {
                 0..=14 => 20.0,
                 15..=20 => 17.0,

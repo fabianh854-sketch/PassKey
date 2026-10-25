@@ -81,7 +81,8 @@ pub struct Tokens {
 }
 
 fn hex(v: u32) -> Color {
-    Color::from_rgb8((v >> 16) as u8, (v >> 8) as u8, v as u8)
+    let [_, r, g, b] = v.to_be_bytes();
+    Color::from_rgb8(r, g, b)
 }
 
 impl Tokens {

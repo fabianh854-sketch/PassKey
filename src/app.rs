@@ -12,6 +12,9 @@ use iced::futures::channel::oneshot;
 use iced::widget::operation::{scroll_to, AbsoluteOffset};
 use iced::widget::{column, container, mouse_area, row, scrollable, stack, Space};
 use iced::{mouse, system, window, Background, Element, Length, Subscription, Task, Theme};
+use rand::rand_core::UnwrapErr;
+use rand::rngs::SysRng;
+use secrecy::{ExposeSecret, SecretString};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::drafts::Drafts;
@@ -22,6 +25,8 @@ use crate::theme::{self, Tokens, DISPLAY};
 use crate::ui::widgets::{self, Icons, Variant};
 
 pub const MIN_MASTER_LEN: usize = 12;
+/// Längeres nimmt das Feld nicht an. Schützt vor riesigen Einfügungen, Argon2 käme damit zurecht.
+const MAX_MASTER_CHARS: usize = 256;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
@@ -122,7 +127,9 @@ pub struct App {
     pub setup_error: Option<SetupError>,
 }
 
-#[derive(Clone, Debug)]
+/// Kein `Debug`: Einige Nachrichten tragen Passwörter (Master-Passwort, Ersteinrichtung).
+/// iced braucht `Debug` nur mit dem Feature `debug`, das PassKey nicht nutzt.
+#[derive(Clone)]
 pub enum Message {
     Tab(Tab),
     // Generator
@@ -186,8 +193,8 @@ impl Launch {
         let has = |flag: &str| args.iter().any(|a| a == flag);
         let file = args
             .iter()
-            .position(|a| a == "--datei")
-            .and_then(|i| args.get(i + 1))
+            .skip_while(|a| *a != "--datei")
+            .nth(1)
             .map(PathBuf::from);
         Self {
             choice: if has("--dark") {
@@ -243,11 +250,8 @@ impl App {
         };
         // Anfangszustände ohne Übergang: nichts bewegt sich beim Start.
         let o = app.opts;
-        for (i, on) in [o.upper, o.lower, o.digits, o.symbols, o.avoid_similar]
-            .into_iter()
-            .enumerate()
-        {
-            app.motion.init_on(Id::Toggle(i as u8), on);
+        for (i, on) in (0u8..).zip([o.upper, o.lower, o.digits, o.symbols, o.avoid_similar]) {
+            app.motion.init_on(Id::Toggle(i), on);
         }
         app.motion.init_on(Id::TabVault, launch.tab == Tab::Vault);
         app.motion.init_strength((o.entropy_bits() / 128.0).min(1.0));
@@ -311,15 +315,17 @@ impl App {
     /// Erzeugt ein Passwort als Entwurf. Mit `replace_current` ersetzt es das aktuelle,
     /// noch nicht gespeicherte Passwort (beim Ändern der Einstellungen).
     fn generate(&mut self, replace_current: bool) {
-        if replace_current {
-            if let Some(d) = self.drafts.current() {
-                if !d.saved {
-                    let id = d.id;
-                    self.drafts.discard(id);
-                }
-            }
+        if replace_current
+            && let Some(d) = self.drafts.current()
+            && !d.saved
+        {
+            let id = d.id;
+            self.drafts.discard(id);
         }
-        if let Some(pw) = generator::generate(&self.opts, &mut rand::rng()) {
+        // Zufall direkt vom Betriebssystem. `UnwrapErr` bricht ab, falls es keinen liefert. Das
+        // kommt unter Windows nicht vor (`ProcessPrng` scheitert laut Doku nie) und ist sicherer,
+        // als mit schwächerem Zufall weiterzumachen.
+        if let Some(pw) = generator::generate(&self.opts, &mut UnwrapErr(SysRng)) {
             self.drafts.push(pw, self.opts, Instant::now());
         }
         // Der Stärkebalken wächst oder schrumpft weich auf den neuen Wert.
@@ -373,14 +379,25 @@ impl App {
             Message::Copy => {
                 if let Some(d) = self.drafts.current() {
                     self.notice = Some(Notice::Copied);
-                    return iced::clipboard::write(d.password.as_str().to_owned());
+                    return iced::clipboard::write(d.password.expose_secret().to_owned());
                 }
             }
-            Message::LabelChanged(s) => self.label = s,
+            Message::LabelChanged(s) => {
+                // Wie ein `maxlength`: Steuerzeichen (etwa aus dem Einfügen) fallen weg, längere
+                // Eingaben werden nicht übernommen.
+                let s: String = s.chars().filter(|c| !c.is_control()).collect();
+                if s.chars().count() <= store::MAX_LABEL_CHARS {
+                    self.label = s;
+                }
+            }
             Message::Save => self.save_current(),
 
             // Bei jedem Tastendruck kommt ein neuer String. Der alte wird vorher überschrieben.
-            Message::MasterInput(s) => {
+            Message::MasterInput(mut s) => {
+                if s.chars().count() > MAX_MASTER_CHARS {
+                    s.zeroize();
+                    return Task::none();
+                }
                 self.master_input.zeroize();
                 self.master_input = s;
                 self.unlock_error = None;
@@ -410,16 +427,24 @@ impl App {
             Message::DiscardDraft(id) => self.drafts.discard(id),
             Message::CopySaved(i) => {
                 if let Some(e) = self.saved().get(i) {
-                    return iced::clipboard::write(e.password.as_str().to_owned());
+                    return iced::clipboard::write(e.password().to_owned());
                 }
             }
 
-            Message::SetupPassword(s) => {
+            Message::SetupPassword(mut s) => {
+                if s.chars().count() > MAX_MASTER_CHARS {
+                    s.zeroize();
+                    return Task::none();
+                }
                 self.setup_password.zeroize();
                 self.setup_password = s;
                 self.setup_error = None;
             }
-            Message::SetupRepeat(s) => {
+            Message::SetupRepeat(mut s) => {
+                if s.chars().count() > MAX_MASTER_CHARS {
+                    s.zeroize();
+                    return Task::none();
+                }
                 self.setup_repeat.zeroize();
                 self.setup_repeat = s;
                 self.setup_error = None;
@@ -536,17 +561,21 @@ impl App {
             return;
         }
         let id = d.id;
-        let entry = store::Entry {
-            label: Zeroizing::new(self.label.trim().to_owned()),
-            password: Zeroizing::new(d.password.as_str().to_owned()),
-            saved_at: chrono::Utc::now().timestamp(),
-            options: d.options,
-        };
+        // `Label` und `Entry::new` prüfen Länge und Zeichen. Die Felder lassen Ungültiges zwar gar
+        // nicht erst zu, die Prüfung hier gilt trotzdem.
+        let entry = store::Label::try_from(self.label.trim().to_owned()).and_then(|label| {
+            store::Entry::new(
+                label,
+                SecretString::from(d.password.expose_secret().to_owned()),
+                chrono::Utc::now().timestamp(),
+                d.options,
+            )
+        });
         // Verschlüsseln und Schreiben dauert nur Millisekunden (keine Schlüsselableitung).
-        match store.add(entry) {
+        match entry.and_then(|e| store.add(e)) {
             Ok(()) => {
                 self.drafts.mark_saved(id);
-                self.label.clear();
+                self.label.zeroize();
                 self.notice = Some(Notice::Saved);
             }
             Err(_) => self.notice = Some(Notice::SaveFailed),

@@ -234,7 +234,15 @@ impl<'a> Fx<'a> {
 }
 
 /// Windows: Einstellungen > Barrierefreiheit > Visuelle Effekte > Animationseffekte.
+///
+/// Die einzige Ausnahme von `unsafe_code = "deny"` im Projekt. `expect` statt `allow`: Fällt das
+/// `unsafe` hier weg, meldet der Compiler die überflüssige Ausnahme.
 #[cfg(windows)]
+#[expect(
+    unsafe_code,
+    reason = "FFI zu SystemParametersInfoW: Ohne diese Abfrage sähen Nutzer mit abgeschalteten \
+              Animationen sie trotzdem. Kein sicherer Ersatz in std; vom Nutzer freigegeben."
+)]
 pub fn system_prefers_reduced_motion() -> bool {
     use std::ffi::c_void;
 
@@ -245,11 +253,15 @@ pub fn system_prefers_reduced_motion() -> bool {
     const SPI_GETCLIENTAREAANIMATION: u32 = 0x1042;
 
     let mut enabled: i32 = 1;
+    // SAFETY: SPI_GETCLIENTAREAANIMATION schreibt laut Windows-Doku genau ein BOOL (4 Byte) nach
+    // `pv`. `enabled` ist ein gültiges, ausgerichtetes `i32` auf dem Stack, das den Aufruf
+    // überlebt; `param` und `flags` sind für diese Aktion 0. Die Signatur oben entspricht der
+    // von `SystemParametersInfoW` in user32.dll (`stdcall`, BOOL-Rückgabe als i32).
     let ok = unsafe {
         SystemParametersInfoW(
             SPI_GETCLIENTAREAANIMATION,
             0,
-            (&mut enabled as *mut i32).cast(),
+            std::ptr::from_mut(&mut enabled).cast(),
             0,
         )
     };
@@ -298,8 +310,10 @@ mod tests {
     #[test]
     fn smooth_scroll_runs_towards_target_and_stops() {
         let t0 = Instant::now();
-        let mut s = Scroll::default();
-        s.max = 500.0;
+        let mut s = Scroll {
+            max: 500.0,
+            ..Scroll::default()
+        };
         s.wheel(120.0, false);
         assert!(s.active);
         let mut at = t0;
@@ -320,8 +334,10 @@ mod tests {
 
     #[test]
     fn scroll_target_is_clamped() {
-        let mut s = Scroll::default();
-        s.max = 100.0;
+        let mut s = Scroll {
+            max: 100.0,
+            ..Scroll::default()
+        };
         s.wheel(500.0, false);
         assert_eq!(s.target, 100.0);
         s.wheel(-900.0, false);
@@ -330,8 +346,10 @@ mod tests {
 
     #[test]
     fn scroll_with_reduced_motion_is_instant() {
-        let mut s = Scroll::default();
-        s.max = 300.0;
+        let mut s = Scroll {
+            max: 300.0,
+            ..Scroll::default()
+        };
         s.wheel(90.0, true);
         assert_eq!(s.current, 90.0);
         assert!(!s.active);

@@ -3,6 +3,7 @@
 use std::time::Instant;
 
 use chrono::{DateTime, Local, TimeZone};
+use secrecy::ExposeSecret;
 use iced::alignment::Vertical;
 use iced::widget::{column, row, text, Space};
 use iced::{Element, Length};
@@ -34,7 +35,9 @@ pub fn locked<'a>(app: &'a App, t: Tokens, fx: &Fx) -> Element<'a, Message> {
         store::Error::WrongPassword => "Das Passwort passt nicht. Versuch es noch einmal.",
         store::Error::Corrupt => "Die Datei ist beschädigt oder stammt aus einer neueren Version.",
         store::Error::Io(_) => "Die Datei lässt sich nicht lesen.",
-        store::Error::Exists | store::Error::Internal => "Das Entsperren ist fehlgeschlagen.",
+        store::Error::Exists | store::Error::Invalid | store::Error::Internal => {
+            "Das Entsperren ist fehlgeschlagen."
+        }
     });
     let busy = app.busy;
 
@@ -135,7 +138,7 @@ pub fn unlocked<'a>(app: &'a App, t: Tokens, fx: &Fx) -> Element<'a, Message> {
         drafts_col = drafts_col.push(txt("Keine offenen Passwörter.", 15.0, INTER, t.ink_muted));
     }
     for d in app.drafts.unsaved() {
-        let shown: &str = if app.reveal { d.password.as_str() } else { MASK };
+        let shown: &str = if app.reveal { d.password.expose_secret() } else { MASK };
         drafts_col = drafts_col.push(divider_el(t)).push(list_row(
             t,
             shown,
@@ -187,13 +190,13 @@ pub fn unlocked<'a>(app: &'a App, t: Tokens, fx: &Fx) -> Element<'a, Message> {
         ));
     }
     for (i, e) in app.saved().iter().enumerate() {
-        let title = if e.label.is_empty() { "Ohne Etikett" } else { e.label.as_str() };
-        let pw: &str = if app.reveal { e.password.as_str() } else { MASK };
+        let title = if e.label().is_empty() { "Ohne Etikett" } else { e.label() };
+        let pw: &str = if app.reveal { e.password() } else { MASK };
         saved_col = saved_col.push(divider_el(t)).push(list_row_titled(
             t,
             title,
             pw,
-            when(e.saved_at, today),
+            when(e.saved_at(), today),
             vec![button_el(
                 t,
                 fx,
@@ -239,7 +242,8 @@ fn list_row_titled<'a>(
     trailing: Vec<Element<'a, Message>>,
 ) -> Element<'a, Message> {
     let main = column![
-        txt(title, 15.0, INTER_MEDIUM, t.ink),
+        // Etiketten bis 64 Zeichen: an Wörtern umbrechen, ein langes Wort notfalls mittendrin.
+        txt(title, 15.0, INTER_MEDIUM, t.ink).wrapping(text::Wrapping::WordOrGlyph),
         txt(password, 14.0, INTER, t.ink).wrapping(text::Wrapping::Glyph),
         txt(when, 13.0, INTER, t.ink_muted),
     ]

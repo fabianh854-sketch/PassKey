@@ -30,7 +30,7 @@ Ansichten: **Erzeugen** (Ausgabe, Stärke, Slider, Schalter, Neu erzeugen, Kopie
 - `src/app.rs`: Zustand, Nachrichten, `update`, `view`, Titelleiste, weiches Scrollen. Entsperren und Anlegen laufen per `in_background` in einem eigenen Thread, das Ergebnis kommt als `Message::VaultReady(Handoff)` zurück.
 - `src/store.rs`: verschlüsselte Datei (Format im Modulkommentar), `Vault::create/open/add`, atomares Schreiben, 11 Tests.
 - `src/theme.rs`: Kiesel-Tokens (hell/dunkel) als Konstanten, Schriften, Kontrast-Test. `WINDOW_W` steuert die Tab-Breite.
-- `src/generator.rs`: Passworterzeugung (`rand::rng()`, ChaCha, vom OS geseedet), Stärke in Bit, Tests.
+- `src/generator.rs`: Passworterzeugung (verlangt `CryptoRng`, die App übergibt `SysRng` = Zufall direkt vom Betriebssystem), Stärke in Bit, Tests.
 - `src/drafts.rs`: RAM-Entwürfe, 30-s-Timer (Zeit wird von außen übergeben, daher testbar), `zeroize`.
 - `src/motion.rs`: Animationszustände (`Animation<bool>` pro Element), `Fx` für die Ansicht, Scroll-Glättung, Windows-Einstellung „Animationen reduzieren“ (per `SystemParametersInfoW`).
 - `src/ui/widgets.rs`: Kiesel-Komponenten (Button mit Varianten Primary/Secondary/Outline/Ghost/Close, Field, Toggle, Slider, Tabs, Badge, Alert, Card, Progress, Trenner).
@@ -53,7 +53,8 @@ Ansichten: **Erzeugen** (Ausgabe, Stärke, Slider, Schalter, Neu erzeugen, Kopie
 
 ## Prüfungen
 
-- `cargo test`: **34 Tests bestehen** (Generator-Längen 12–32, Zeichenarten, Entwurfs-Timer mit simulierter Uhr, Kiesel-Kontrast in beiden Themes, Bewegung, Scroll-Glättung; Datei: Roundtrip, falsches Passwort, jedes geänderte Byte, geänderte und absurde Argon2-Parameter, fremde, abgeschnittene und neuere Datei, nie überschreiben, frische Nonce, kein Klartext, Rückrollen bei Schreibfehler, Decoder-Grenzen).
+- `cargo test`: **38 Tests bestehen** (Generator-Längen 12–32, Zeichenarten, Entwurfs-Timer mit simulierter Uhr, Kiesel-Kontrast in beiden Themes, Bewegung, Scroll-Glättung; Datei: Roundtrip, falsches Passwort, jedes geänderte Byte, geänderte und absurde Argon2-Parameter, fremde, abgeschnittene und neuere Datei, nie überschreiben, frische Nonce, kein Klartext, Rückrollen bei Schreibfehler, Decoder-Grenzen, übergroße Datei, Etikett- und Passwortregeln, ungültiger Inhalt).
+- `cargo clippy --all-targets -- -D warnings` ist sauber (Lints in `Cargo.toml`, Test-Ausnahmen in `clippy.toml`). `cargo fmt --check` ist es nicht: Der Code war nie mit rustfmt formatiert (schon vor dem Sicherheits-Durchgang).
 - Phase 2 im echten Fenster geprüft (mit `--datei` im Scratchpad): Ersteinrichtung (0,2 s), zwei Einträge mit Etikett speichern, Schließen, Neustart, falsches Passwort abgelehnt, richtiges zeigt beide Einträge in richtiger Reihenfolge, kein Klartext in der Datei. Die echte Datei unter `%APPDATA%` blieb unberührt.
 - Im echten Fenster geprüft (per Skript mit simulierter Maus und Pixelmessung): 30-s-Löschen nach Minimieren (10 s Minimieren: Passwort bleibt; 36 s: gelöscht), normales Schließen, Ziehen/Minimieren/Schließen der Titelleiste, Hover-Übergänge, Schalter, Tabs, Scrollen inkl. Grenzen, abgerundete Ecken, gleiche Panel-Breiten (x 16–383 in allen Ansichten), `--no-motion`, Leerlauf-CPU gering.
 - Die Prüfskripte (PowerShell) lagen im Scratchpad der Sitzung und sind nicht im Projekt.
@@ -62,7 +63,6 @@ Ansichten: **Erzeugen** (Ausgabe, Stärke, Slider, Schalter, Neu erzeugen, Kopie
 
 - Fenster 400 × 700 statt 380 × 600 (Kiesels 24-px-Kartenrand und 44-px-Zielhöhen).
 - Fehlermeldung beim falschen Passwort steht am Feld (Rand + Text) statt in einer Alert-Box.
-- Zufall über `rand::rng()` statt direkt `OsRng` (ebenfalls kryptografisch sicher).
 - Schalter-Namen verkürzt: „Groß (A–Z)“, „Klein (a–z)“, „Zahlen“, „Symbole“, „Ähnliche Zeichen meiden“.
 
 ## Noch offen
@@ -70,6 +70,8 @@ Ansichten: **Erzeugen** (Ausgabe, Stärke, Slider, Schalter, Neu erzeugen, Kopie
 **Phase 2 ist umgesetzt:** Argon2id (64 MiB, 3 Durchläufe, 1 Lane), XChaCha20-Poly1305, Kopf mit Kennung, Version, Parametern, Salt und Nonce als AAD, Parameter-Obergrenzen beim Lesen, atomares Schreiben, `zeroize`. Kleiner Rest: `when` in `ui/vault.rs` zeigt noch `25.10.2026, 14:08` statt „Heute, 14:08“.
 
 **Phase 3:** Profil-Ablauf mit echter Datei, Sperren beim Schließen, Fehlerzustände, Packaging. Offene Idee: Auto-Sperre nach Inaktivität (z. B. 5 Minuten).
+
+**Sicherheits-Durchgang (Skill rust-secure-coding, 2026-10-25):** Dateiparser ohne `expect` und ohne direkte Indizes, Datei höchstens 8 MiB, Etikett als geprüfter Typ `Label` (höchstens 64 Zeichen, keine Steuerzeichen, das Feld nimmt nicht mehr an), Master-Passwort höchstens 256 Zeichen, Passwörter, Etiketten und Schlüssel in `secrecy` (`SecretString`, `SecretBox`), `Message` ohne `Debug`, Casts über `from`/`try_from`, Puffer im Generator vorab reserviert, Release mit `overflow-checks` und `strip`. `unsafe_code = "deny"` gilt fürs ganze Crate. Einzige, vom Nutzer ausdrücklich freigegebene Ausnahme: `system_prefers_reduced_motion` in `motion.rs` (FFI für „Animationen anzeigen“) mit `#[expect(unsafe_code, reason = …)]` und SAFETY-Kommentar. Offen: zwei `#[allow(clippy::too_many_arguments)]` in `ui/widgets.rs`.
 
 **Bewusst fehlend:**
 - Anheben um 1 px beim Hover und Schrumpfen beim Drücken der Buttons (iced kann Widgets nicht fein verschieben).
